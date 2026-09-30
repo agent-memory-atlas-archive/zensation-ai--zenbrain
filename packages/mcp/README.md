@@ -43,7 +43,7 @@ npm install -g @zensation/mcp
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ZENBRAIN_DB` | `./zenbrain.db` | Path to the SQLite file. `:memory:` gives a store that is discarded when the process exits. |
+| `ZENBRAIN_DB` | `./zenbrain.db` | Path to the SQLite file. A leading `~/` means your home directory. A relative path is relative to the directory your client starts the server in — some clients, Claude Desktop among them, may start it in `/`, where nothing can be written — so give an absolute or `~/` path. `:memory:` gives a store that is discarded when the process exits. |
 | `ZENBRAIN_CONTEXTS` | `personal,work,learning,creative` | Comma-separated context domains for cross-context memory. |
 
 The server speaks MCP over stdio. Stdout carries protocol traffic only; diagnostics go
@@ -124,15 +124,12 @@ the claim the core makes.
 ## About ZenBrain
 
 ZenBrain is a seven-layer, neuroscience-derived memory architecture for LLM agents, built as
-zero-dependency TypeScript and published under Apache-2.0. On LongMemEval-500 three of nine
-head-to-head answer-quality comparisons hold against Letta, Mem0 and A-Mem — all three against
-A-Mem, the remaining six are ties, none lost (three competitors x three LLM judges,
-Bonferroni-corrected, version-matched) — reaching 91.3% of a full-context oracle's binary-judge
-accuracy at 1/109.6 of the per-query token cost.
+zero-dependency TypeScript and published under Apache-2.0. The benchmark results, and the
+configuration they were measured in, are reported in the paper; the reproduction packages
+are on Zenodo.
 
 Works out of the box without an embedding provider — lexical ranking, zero
-dependencies. With `nomic-embed-text` as the embedding provider you get the
-configuration those figures were measured in.
+dependencies. The paper's measurements used `nomic-embed-text` as the embedding provider.
 
 - Source and issues: [github.com/zensation-ai/zenbrain](https://github.com/zensation-ai/zenbrain)
 - Paper: [arXiv:2604.23878](https://arxiv.org/abs/2604.23878) · Open-access archive: [10.5281/zenodo.19353663](https://doi.org/10.5281/zenodo.19353663)
