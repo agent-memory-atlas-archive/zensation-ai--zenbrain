@@ -166,9 +166,9 @@ describe('SqliteAdapter query translation', () => {
     expect(result.rows).toHaveLength(1);
   });
 
-  it('translates NOW() to datetime("now")', async () => {
+  it('translates NOW() to the current time as ISO 8601 UTC', async () => {
     const adapter = createMemoryAdapter();
-    // Use NOW() in a query — should be translated to datetime('now')
+    // Use NOW() in a query — must come out in the one format the adapter writes
     await adapter.query(
       "INSERT INTO core_memory_blocks (id, label, content, updated_at) VALUES ($1, $2, $3, NOW())",
       ['b1', 'test_label', 'test content'],
@@ -179,8 +179,9 @@ describe('SqliteAdapter query translation', () => {
       ['b1'],
     );
     expect(result.rows).toHaveLength(1);
-    // Should be a valid datetime string
-    expect(result.rows[0].updated_at).toMatch(/^\d{4}-\d{2}-\d{2}/);
+    // The shape Date.prototype.toISOString() produces — see timestamps.test.ts
+    expect(result.rows[0].updated_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(Math.abs(Date.parse(result.rows[0].updated_at) - Date.now())).toBeLessThan(60_000);
   });
 
   it('translates gen_random_uuid() to a UUID-like value', async () => {
@@ -194,6 +195,27 @@ describe('SqliteAdapter query translation', () => {
     expect(result.rows[0].uuid).toMatch(/^[0-9a-f-]+$/);
     // Should have the right length (36 chars)
     expect(result.rows[0].uuid.length).toBe(36);
+  });
+
+  it('binds booleans as 1 and 0', async () => {
+    // better-sqlite3 refuses booleans outright; the core layer passes `pinned`
+    // as one, which made every core-memory write fail before this coercion.
+    const adapter = createMemoryAdapter();
+    await adapter.query(
+      'INSERT INTO core_memory_blocks (id, label, content, pinned) VALUES ($1, $2, $3, $4)',
+      ['b-true', 'yes', 'pinned', true],
+    );
+    await adapter.query(
+      'INSERT INTO core_memory_blocks (id, label, content, pinned) VALUES ($1, $2, $3, $4)',
+      ['b-false', 'no', 'not pinned', false],
+    );
+    const result = await adapter.query<{ id: string; pinned: number }>(
+      'SELECT id, pinned FROM core_memory_blocks ORDER BY id',
+    );
+    expect(result.rows).toEqual([
+      { id: 'b-false', pinned: 0 },
+      { id: 'b-true', pinned: 1 },
+    ]);
   });
 
   it('handles undefined params as null', async () => {

@@ -2,6 +2,167 @@
 
 All notable changes to ZenBrain are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+On `main`, not yet published to npm: the versions npm serves were released from `v0.4.7` on
+2026-09-21, and everything below came after.
+
+### Fixed — recall without an embedding provider answered every query with the same rows (#95)
+
+Without an `EmbeddingProvider`, `semantic.search` returned `getRecent(limit)` and never read the
+query. `episodic` did the same; `procedural` ranked by recorded success rate, a real signal but
+just as blind to the query. Every SQLite user lands on this path, a default
+`npx @zensation/mcp` install included, because the vector branch is pgvector-only. Measured on
+2026-09-26 against `npx -y @zensation/mcp` with three unrelated facts stored:
+
+| Query | Before | After |
+|---|---|---|
+| `Leuchtturm` | all three rows, every score 0 | one result, score 1.0 |
+| `Backrezept mit Speck` | the same three rows, every score 0 | one result, score 0.318 |
+
+The non-vector path now ranks by wording (`packages/core/src/lexical.ts`, no dependencies):
+folded tokens (umlauts, sharp s, accents), a small DE/EN stop list, IDF weighting over a recency
+window of 500 rows, and a bonus when a candidate carries the query as an adjacent phrase.
+Procedural memory keeps its success rate as a weight on top. A score of 0 now means that nothing
+matched. The path matches wording, not meaning: synonyms still need an embedding provider.
+
+### Fixed — `zenbrain_recall` described a default it does not use
+
+The tool description told MCP clients that `zenbrain_recall` *"searches every layer by
+default"*. The input schema said *"defaults to all but working"*, and the handler searched four
+layers: episodic, semantic, procedural and core. Working memory is searched only when a client
+names it; short-term and cross-context memory are not reachable through `recall`. Glama's
+automated assessment of the tool definitions flagged the contradiction (as of 2026-09-18).
+
+The default is now one list in `packages/mcp/src/server.ts`. The handler passes it to the
+coordinator, and the tool description and the schema text are written from it, so the three can
+no longer disagree. Two new tests hold this: one reads the layers off the call the handler
+actually makes and checks the description against them; the other stores a memory and checks
+that a default recall leaves working memory out while an explicit request finds it. What a
+recall returns is unchanged. `packages/mcp/README.md` carried the same sentence and is corrected.
+
+### Fixed — core memory could not be written on SQLite
+
+`store(…, { type: 'core' })`, and every store with a confidence above 0.9 — the documented route
+into core memory — failed on SQLite with *"SQLite3 can only bind numbers, strings, bigints,
+buffers, and null"*, and nothing was written. The core layer passes a block's `pinned` flag as a
+boolean; better-sqlite3 binds no booleans. Measured on 2026-09-28 against the published
+`@zensation/mcp` 0.1.6: both calls errored, and `zenbrain_health` reported zero core blocks.
+
+The adapter now binds `true` and `false` as `1` and `0`, next to the `Date` coercion it already
+did, and the core layer hands `pinned` back as a real boolean on both adapters. Tested through
+the coordinator and through `zenbrain_store` over a real SQLite store.
+
+### Fixed — core blocks created by `store()` could replace each other
+
+`store(…, { type: 'core' })` labels the new block itself, and a block with the same label is
+updated in place. The label was the first 50 characters with everything outside `[a-zA-Z0-9_ -]`
+removed. Measured on 2026-09-28 against a real SQLite store: two Chinese sentences both got the
+label `""` and the second replaced the first; two English sentences that share their first 50
+characters did the same; `Über` became `ber`. On PostgreSQL this happened already; on SQLite the
+fix above is what makes core blocks writable, so the two changes ship together.
+
+The label is now the first words of the content in any script, plus eight hex digits of a hash of
+the whole content. Different memories never share a label, and the same memory stored twice
+updates one block. A block written under an old-style label and stored again verbatim keeps that
+label instead of gaining a twin. The label format was never documented; code that reads blocks
+by label should keep choosing its own labels with `getCoreMemory().upsertBlock(label, content)`.
+
+### Fixed — SQLite wrote two timestamp formats, and three queries went wrong because of it
+
+`NOW()` and the column defaults wrote SQLite's `datetime('now')` — `2026-09-28 21:25:17`, no zone
+— while `Date` parameters arrived as ISO strings with `Z`. One table, sometimes one row, held both
+(`created_at` beside `fsrs_next_review`); a project that builds on the schema had to catch a
+crash when comparing the two. Measured on 2026-09-28 against the published packages and a real
+database file, each case with a control that shows the query can find the row at all:
+
+| Case | Before | Control |
+|---|---|---|
+| a fact due for one hour | `getDueForReview` returns nothing | due for 25 hours: returned |
+| an episode stored just now | `getByTimeRange(today 00:00Z, …)` returns nothing | range from yesterday: returned |
+| `created_at` 21:25:17 UTC | `createdAt` 19:25:17Z in Europe/Berlin | — |
+
+Text comparison puts `' '` before `'T'`, so on the day itself the zone-less value always lost;
+and JavaScript reads a date-time without `T` or zone as local time.
+
+The adapter now writes one format everywhere: ISO 8601, UTC, milliseconds, `Z`, the shape
+`Date.prototype.toISOString()` produces. A database written by an earlier version is rewritten
+once when the adapter opens it, in one transaction, and `PRAGMA user_version` records it — schema
+version 1, exported as `SCHEMA_VERSION`. Only text SQLite can read as a time is rewritten;
+anything else stays as it was. Checked on two database files that the published 0.1.6 wrote the
+same day: every timestamp rewritten to the same instant, and the three cases above right.
+
+SQLite cannot change a column default without rebuilding the table, so tables created before
+this version keep `datetime('now')` as their default. The layers never rely on it; code that
+inserts into these tables directly and leaves the timestamp out should write
+`strftime('%Y-%m-%dT%H:%M:%fZ','now')`. The adapter README now documents every table, its
+columns and the timestamp format, and no longer claims that SQLite has no similarity search or
+falls back to recency: it has both a cosine scan and, without an embedding provider, the lexical
+ranking of #95.
+
+### Fixed — every consolidation pass promoted the same episodes again
+
+`consolidate()` looks at the 100 most recent episodes and turns each one with an emotional weight
+above 0.5 into a semantic fact. Nothing recorded that it had done so, so the next pass did it
+again. Measured on 2026-09-28 against the published `@zensation/mcp` 0.1.6 with a real SQLite
+file: one episode with weight 0.8, three passes, three identical facts. The tool description
+called the pass *"safe to run periodically"*, and `docs/recipes.md` suggests running it hourly.
+
+A promoted episode is now marked in its own `metadata` (`consolidatedInto: <fact id>`), which both
+adapters already store, and later passes leave it alone. An episode that an earlier version
+promoted verbatim is recognised by that fact and only marked, so upgrading does not add one more
+copy. Copies made before this version stay where they are: consolidation deletes nothing.
+
+The descriptions now say what the pass does. The MCP tool, its README and `docs/recipes.md` spoke
+of promoting *"repeated episodes"* and of pruning *"what has fallen below the retention
+threshold"*; the selection is by emotional weight, and `pruned` has always been 0 because nothing
+prunes. `docs/api-reference.md` said *"based on access patterns"*, and gave `decay()` a signature
+it does not have (`Promise<{ decayed, pruned }>`; it is `{ removed: number }`, synchronous).
+
+Tests on a real SQLite store: three passes promote `[1, 0, 0]` (before: `[1, 1, 1]`), the mark
+keeps other metadata, an earlier verbatim promotion is not copied again, and `pruned` is 0 with
+nothing deleted; the same three-pass check runs over MCP. A database file that 0.1.6 wrote with
+three copies of one fact gets no fourth.
+
+### Added — tests for the two start paths that silenced 0.1.3 on macOS and Windows
+
+does-it-install's weekly runs have listed `@zensation/mcp` as failing on two of three platforms
+since 2026-08-31: Linux passed, macOS and Windows ended the handshake with *"Connection closed"*.
+Those runs test 0.1.3, whose entry guard compared `import.meta.url` with a `file://${argv[1]}`
+template. Reproduced on 2026-09-28 by installing the published packages the way the service does,
+into a prefix under `os.tmpdir()`, and starting `node <prefix>/…/dist/index.js`:
+
+| Version | Path as the service passes it (`/var/…`) | Same file, resolved (`/private/var/…`) |
+|---|---|---|
+| 0.1.3 | exits 0, nothing on stdout or stderr | answers, four tools |
+| 0.1.6 | answers, four tools | answers, four tools |
+
+On macOS every `os.tmpdir()` lies under `/var`, a symlink to `/private/var`. On Windows the
+runners' temp path carries the 8.3 short name `RUNNER~1`, and `pathToFileURL` writes `~` as `%7E`
+where the template leaves it alone; that part is shown on the URL functions, not on a Windows
+machine. Linux temp paths have neither. The guard fixed in 0.1.5 (#86) compares resolved path with
+resolved path and handles both. The entry-guard tests now pin both shapes, the tilde as a unit case
+and the directory symlink as a real start through a linked package directory. With the 0.1.3 guard
+put back, five of the eight fail.
+
+### Changed
+
+- **`zenbrain_store` describes its routing as the code does it.** It said *"a narrated event becomes an
+  episode"*; the router decides by emotional weight (above 0.5), whatever the form of the text. The
+  description now names all four routes (procedure, episode, pinned core memory above confidence 0.9,
+  semantic fact) and the side effects: every call adds a memory except a repeated core memory, which
+  is updated, and the content is also kept in working memory while the server runs. A test over a
+  real SQLite store checks each route and the exception against the layer counts.
+- **The MCP registry entry is published on release** (#94). `packages/mcp/server.json` was bumped
+  with every release, but no step ever pushed it: on 2026-09-26 the official registry still
+  served 0.1.3, three patch versions behind npm. The new workflow runs on every `v*` tag and can
+  be started by hand; it checks the result by the registry's `isLatest` flag, not by the first
+  entry of the version list.
+- **Every README that prints the LongMemEval-500 figures names the configuration they were
+  measured in** (#96): `nomic-embed-text` as the embedding provider. A default install takes the
+  lexical path above, which is not that configuration. npm shows a README as it was at publish
+  time, so these sentences reach the package pages with the next release.
+
 ## [0.4.7] — 2026-09-21
 
 **All six packages bumped** (patch only), so that corrected README text reaches the npm package

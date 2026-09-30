@@ -92,11 +92,11 @@ export interface RecallResult {
 }
 
 export interface ConsolidationResult {
-  /** Number of episodic memories promoted to semantic facts. */
+  /** Number of episodic memories promoted to semantic facts in this pass. */
   promoted: number;
   /** Number of working memory slots decayed. */
   decayed: number;
-  /** Number of items pruned (below retention threshold). */
+  /** Always 0: consolidation deletes nothing from long-term memory. Kept for the result's shape. */
   pruned: number;
 }
 
@@ -134,6 +134,20 @@ const PROCEDURAL_PATTERNS = [
 /** Check if content looks like procedural knowledge. */
 function looksLikeProcedure(content: string): boolean {
   return PROCEDURAL_PATTERNS.some(p => p.test(content));
+}
+
+/**
+ * 32-bit FNV-1a over the UTF-16 code units, as eight hex digits. Stable and
+ * dependency-free (core also runs in the browser, so no node:crypto); enough
+ * to tell the labels of different memories apart.
+ */
+function fnv1a(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
 }
 
 // ===========================================
@@ -258,8 +272,7 @@ export class MemoryCoordinator {
       }
 
       case 'core': {
-        const label = content.substring(0, 50).replace(/[^a-zA-Z0-9_ -]/g, '').trim();
-        const block = await this.core.upsertBlock(label, content);
+        const block = await this.core.upsertBlock(await this.coreLabelFor(content), content);
         storedId = block.id;
         this.log.debug(`Stored as core block: ${storedId}`);
         break;
@@ -392,13 +405,24 @@ export class MemoryCoordinator {
   // ===========================================
 
   /**
-   * Promote frequently accessed episodic memories to semantic facts.
+   * Promote emotionally significant episodes to semantic facts, once each,
+   * and decay working memory.
    *
-   * Scans recent episodes and, for those with high access patterns or
-   * emotional significance, creates a corresponding semantic fact.
-   * This mirrors the hippocampal-to-cortical transfer during sleep.
+   * Looks at the 100 most recent episodes. Each one with an emotional weight
+   * above 0.5 that has not been promoted before becomes a semantic fact
+   * (distilled by the LLM when one is configured, verbatim otherwise), and the
+   * episode is marked in its metadata (`consolidatedInto: <fact id>`). This
+   * mirrors the hippocampal-to-cortical transfer during sleep.
    *
-   * @returns Counts of promoted, decayed, and pruned memories.
+   * Nothing in long-term memory is deleted: `pruned` is part of the result's
+   * shape and is always 0.
+   *
+   * Until the mark existed, every pass promoted the same episodes again —
+   * measured on 2026-09-28 against @zensation/mcp 0.1.6 with a real SQLite
+   * file: three passes, three identical facts. An episode an earlier version
+   * already promoted verbatim is recognised by that fact and only marked.
+   *
+   * @returns Counts of promoted episodes, decayed working-memory slots, and pruned items (0).
    */
   async consolidate(): Promise<ConsolidationResult> {
     let promoted = 0;
@@ -409,28 +433,33 @@ export class MemoryCoordinator {
 
     for (const episode of episodes) {
       const emotionalWeight = episode.emotionalWeight ?? 0;
-      const isSignificant = emotionalWeight > 0.5;
+      if (emotionalWeight <= 0.5 || this.episodic.isConsolidated(episode)) continue;
 
-      // Promote emotionally significant or contextually rich episodes
-      if (isSignificant) {
-        let summary = episode.content;
-
-        // If LLM is available, generate a distilled fact
-        if (this.llm) {
-          try {
-            summary = await this.llm.generate(
-              'You are a memory consolidation system. Extract the key factual insight from this episode in one concise sentence.',
-              episode.content,
-              { maxTokens: 100, temperature: 0.3 }
-            );
-          } catch {
-            this.log.warn('LLM consolidation failed, using raw content');
-          }
-        }
-
-        await this.semantic.storeFact(summary, 'consolidation', 0.7);
-        promoted++;
+      // Promoted verbatim by an earlier version that left no mark: mark it, do not copy it again.
+      const earlier = await this.semantic.findExact(episode.content, 'consolidation');
+      if (earlier) {
+        await this.episodic.markConsolidated(episode, earlier.id);
+        continue;
       }
+
+      let summary = episode.content;
+
+      // If LLM is available, generate a distilled fact
+      if (this.llm) {
+        try {
+          summary = await this.llm.generate(
+            'You are a memory consolidation system. Extract the key factual insight from this episode in one concise sentence.',
+            episode.content,
+            { maxTokens: 100, temperature: 0.3 }
+          );
+        } catch {
+          this.log.warn('LLM consolidation failed, using raw content');
+        }
+      }
+
+      const fact = await this.semantic.storeFact(summary, 'consolidation', 0.7);
+      await this.episodic.markConsolidated(episode, fact.id);
+      promoted++;
     }
 
     // Apply decay to working memory
@@ -592,6 +621,33 @@ export class MemoryCoordinator {
   // ===========================================
   // Private Helpers
   // ===========================================
+
+  /**
+   * The label a core block gets when `store()` creates it: the first words of
+   * the content, in whatever script, plus a short hash of the whole content.
+   * Two different memories never share a label; the same memory stored twice
+   * updates one block.
+   *
+   * The label used to be the first 50 characters with everything outside
+   * [a-zA-Z0-9_ -] removed. Measured on 2026-09-28 against a real SQLite store:
+   * two Chinese sentences both became the label "" and the second replaced the
+   * first; two English sentences sharing their first 50 characters did the
+   * same; "Über" became "ber". A block written under such a label and stored
+   * again verbatim keeps its label instead of gaining a twin.
+   */
+  private async coreLabelFor(content: string): Promise<string> {
+    const legacy = content.substring(0, 50).replace(/[^a-zA-Z0-9_ -]/g, '').trim();
+    if ((await this.core.getBlock(legacy))?.content === content) return legacy;
+
+    const words = content
+      .normalize('NFC')
+      .replace(/[^\p{L}\p{N}_ -]+/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 40)
+      .trim();
+    return `${words} #${fnv1a(content)}`;
+  }
 
   /**
    * Resolve the target memory type from content and options.
